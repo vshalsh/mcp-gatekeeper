@@ -27,6 +27,7 @@ def scan(paths, fail_on="high"):
             if f.incomplete:  # fail closed: an unverifiable entry makes the scan incomplete
                 errors.append({"file": f.file, "message": f"could not verify entry at {f.json_path} "
                                                          f"(line {f.line}): unexpected shape ({f.rule})"})
-    threshold = None if fail_on in (None, "none") else Severity.parse(fail_on)
+    review = fail_on == "review"
+    threshold = None if fail_on in (None, "none") else Severity.MEDIUM if review else Severity.parse(fail_on)
     return ScanResult(docs=found.docs, findings=findings, errors=errors,
-                      skipped=found.skipped, fail_on=threshold)
+                      skipped=found.skipped, fail_on=threshold, fail_on_review=review)

@@ -28,8 +28,11 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("paths", nargs="+", metavar="PATH",
                    help="config file, tool manifest, or directory to walk")
     s.add_argument("--format", choices=["text", "json"], default="text", help="output format (default: text)")
-    s.add_argument("--fail-on", choices=SEVERITY_LABELS + ["none"], default="high",
-                   help="exit 1 when any finding is at or above this severity (default: high)")
+    s.add_argument("--fail-on", choices=["info", "low", "review", "medium", "high", "critical", "none"],
+                   default="high",
+                   help="exit 1 when any finding is at or above this severity (default: high); "
+                        "'review' also blocks review-class findings (GK04R) and is the recommended "
+                        "setting for manifest gating in CI")
     s.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                    help="ANSI colour for text output (default: auto = only on a TTY, honours NO_COLOR)")
     s.add_argument("--redact", action="store_true",

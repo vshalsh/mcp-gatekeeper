@@ -13,6 +13,9 @@ from .models import SEVERITY_LABELS, Finding, Severity, SourceDoc, redact
 from .schema import SCHEMA_VERSION
 
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
+# Review-class rules: suspected but uncertain matches. They never block at the default
+# threshold; `--fail-on review` (or medium and below) makes them blocking.
+REVIEW_RULES = frozenset({"GK04R"})
 
 
 @dataclass
@@ -22,12 +25,20 @@ class ScanResult:
     errors: list[dict] = field(default_factory=list)
     skipped: list[dict] = field(default_factory=list)
     fail_on: Optional[Severity] = Severity.HIGH  # None means never fail on findings
+    fail_on_review: bool = False  # `--fail-on review`: review-class findings block too
 
     @property
     def failing(self) -> list[Finding]:
         if self.fail_on is None:
             return []
-        return [f for f in self.findings if f.severity >= self.fail_on]
+        return [f for f in self.findings
+                if f.severity >= self.fail_on or (self.fail_on_review and f.rule in REVIEW_RULES)]
+
+    @property
+    def fail_on_label(self) -> str:
+        if self.fail_on is None:
+            return "none"
+        return "review" if self.fail_on_review else self.fail_on.label
 
     @property
     def exit_code(self) -> int:
@@ -63,7 +74,7 @@ def to_report(result: ScanResult, redact_secrets: bool = False) -> dict:
         "tool": "mcp-gatekeeper",
         "version": __version__,
         "schema_version": SCHEMA_VERSION,
-        "fail_on": result.fail_on.label if result.fail_on is not None else "none",
+        "fail_on": result.fail_on_label,
         "passed": result.exit_code == EXIT_OK,
         "exit_code": result.exit_code,
         "scanned_files": [
@@ -172,6 +183,9 @@ def render_text(result: ScanResult, out: TextIO, color: bool = False) -> None:
     if code == EXIT_OK and result.fail_on is None and result.findings:
         # --fail-on none: findings were reported, not judged, so do not claim PASS.
         verdict = ("REPORT", _SEV_COLOR[max(f.severity for f in result.findings)])
-    threshold = result.fail_on.label if result.fail_on is not None else "none"
+    elif code == EXIT_OK and any(f.rule in REVIEW_RULES for f in result.findings):
+        # Nothing blocks, but suspected obfuscation needs a human look: not a clean PASS.
+        verdict = ("REVIEW", _SEV_COLOR[Severity.MEDIUM])
+    threshold = result.fail_on_label
     out.write(f"\n{paint(verdict[1], verdict[0])}  {len(result.findings)} finding(s): {parts}  "
               f"(fail-on: {threshold}, exit {code})\n")
