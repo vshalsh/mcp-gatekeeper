@@ -66,7 +66,6 @@ def test_deep_nesting_inside_valid_config_no_crash(tmp_path):
     assert "Traceback" not in r.stderr and r.returncode in (1, 2)
 
 
-@pytest.mark.xfail(strict=True, reason="L-002 defect D2: PyYAML RecursionError escapes as a traceback on deeply nested flow YAML")
 def test_yaml_deep_nesting_no_crash(tmp_path):
     p = tmp_path / "m.yaml"
     p.write_text("a: " + "[" * 500 + "]" * 500 + "\n")
@@ -137,7 +136,6 @@ def test_top_level_array_manifest_is_scanned(tmp_path):
     assert any(f.rule == "GK04" for f in res.findings)
 
 
-@pytest.mark.xfail(strict=True, reason="L-002 defect D1: YAML alias expansion in parse_yaml conv() is exponential (230-byte file = 7s, 266-byte = 93s)")
 def test_yaml_bomb_does_not_hang(tmp_path):
     p = tmp_path / "bomb.yaml"
     lines = ['a: &a ["lol","lol","lol","lol","lol","lol","lol","lol","lol"]']

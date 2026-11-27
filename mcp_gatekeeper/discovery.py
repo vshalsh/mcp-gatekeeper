@@ -53,6 +53,10 @@ class ParseError(Exception):
 _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 _NUMBER = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _MAX_DEPTH = 200
+# Upper bound on nodes produced when expanding YAML anchors/aliases. Aliases
+# are re-expanded at every use, so nested aliases ("billion laughs") grow
+# exponentially; anything past this cap is rejected rather than walked.
+MAX_YAML_NODES = 100_000
 
 
 class _JsonParser:
@@ -235,6 +239,8 @@ def parse_json(doc: SourceDoc) -> Node:
 def parse_yaml(doc: SourceDoc) -> Node:
     try:
         root = yaml.compose(doc.text, Loader=yaml.SafeLoader)
+    except RecursionError:
+        raise ParseError("document nested too deeply") from None
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         if mark is not None:
@@ -243,10 +249,14 @@ def parse_yaml(doc: SourceDoc) -> Node:
     if root is None:
         raise ParseError("empty document")
     constructor = yaml.SafeLoader("")
+    budget = [MAX_YAML_NODES]
 
     def conv(yn, path: str, depth: int) -> Node:
         if depth > _MAX_DEPTH:
             raise ParseError("document nested too deeply")
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise ParseError(f"YAML alias expansion too large (more than {MAX_YAML_NODES} nodes)")
         s, e = yn.start_mark.index, yn.end_mark.index
         if isinstance(yn, yaml.MappingNode):
             items = []
@@ -267,7 +277,10 @@ def parse_yaml(doc: SourceDoc) -> Node:
             val = str(val)
         return Node(kind, val, path, doc, s, e)
 
-    return conv(root, "$", 0)
+    try:
+        return conv(root, "$", 0)
+    except RecursionError:
+        raise ParseError("document nested too deeply") from None
 
 
 # ---------------------------------------------------------------------------
