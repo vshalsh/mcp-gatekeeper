@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Optional, Sequence
 
@@ -58,11 +59,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_ERROR
 
     result = scan(args.paths, fail_on=args.fail_on)
-    if args.format == "json":
-        render_json(result, out, redact_secrets=args.redact)
-    else:
-        render_text(result, out, color=use_color(args.color, out))
+    try:
+        if args.format == "json":
+            render_json(result, out, redact_secrets=args.redact)
+        else:
+            render_text(result, out, color=use_color(args.color, out))
+        out.flush()
+    except (BrokenPipeError, OSError) as exc:
+        # The report could not be delivered (closed pipe, full disk): that is an
+        # incomplete run, not a pass. Silence the interpreter's own flush at exit.
+        _discard_stdout()
+        try:
+            sys.stderr.write(f"mcp-gatekeeper: could not write report: {exc.strerror or exc}\n")
+        except OSError:
+            pass
+        return EXIT_ERROR
     return result.exit_code
+
+
+def _discard_stdout() -> None:
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 if __name__ == "__main__":  # pragma: no cover

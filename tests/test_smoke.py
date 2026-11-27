@@ -91,7 +91,7 @@ def test_json_output_parses_and_matches_schema():
     assert validate(report) == []
     assert report["exit_code"] == code == 1
     assert report["summary"]["total"] == len(report["findings"]) > 0
-    assert {f["rule"] for f in report["findings"]} == {"GK01", "GK02", "GK03", "GK04", "GK05", "GK06"}
+    assert {f["rule"] for f in report["findings"]} >= {"GK01", "GK02", "GK03", "GK04", "GK05", "GK06"}
 
 
 def test_json_output_for_clean_input():

@@ -19,8 +19,14 @@ def scan(paths, fail_on="high"):
         paths = [paths]
     found = discover(list(paths))
     findings = []
+    errors = list(found.errors)
     for doc in found.docs:
-        findings.extend(run_rules(doc))
+        doc_findings = run_rules(doc)
+        findings.extend(doc_findings)
+        for f in doc_findings:
+            if f.incomplete:  # fail closed: an unverifiable entry makes the scan incomplete
+                errors.append({"file": f.file, "message": f"could not verify entry at {f.json_path} "
+                                                         f"(line {f.line}): unexpected shape ({f.rule})"})
     threshold = None if fail_on in (None, "none") else Severity.parse(fail_on)
-    return ScanResult(docs=found.docs, findings=findings, errors=found.errors,
+    return ScanResult(docs=found.docs, findings=findings, errors=errors,
                       skipped=found.skipped, fail_on=threshold)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -71,7 +72,7 @@ class _JsonParser:
         return ParseError(msg, line, col)
 
     def parse(self) -> Node:
-        if self.t.startswith("﻿"):
+        if self.t.startswith("\ufeff"):
             self.i = 1
         self.ws()
         if self.i >= self.n:
@@ -295,15 +296,16 @@ def _looks_like_server(node: Node) -> bool:
 
 
 def _entries(container: Node) -> list[Entry]:
-    return [Entry(k, vn) for k, _kn, vn in container.items() if vn.kind == "object"]
+    # Every entry is kept, whatever its shape: malformed entries must reach the
+    # GK00 integrity check rather than being silently dropped.
+    return [Entry(k, vn) for k, _kn, vn in container.items()]
 
 
 def _tool_entries(arr: Node) -> list[Entry]:
     out = []
     for el in arr.elements():
-        if el.kind == "object":
-            name = el.get("name")
-            out.append(Entry(name.value if name is not None and name.is_str else "", el))
+        name = el.get("name") if el.kind == "object" else None
+        out.append(Entry(name.value if name is not None and name.is_str else "", el))
     return out
 
 
@@ -315,17 +317,19 @@ def classify(doc: SourceDoc) -> bool:
         return False
     if root.kind == "object":
         servers = root.get("mcpServers")
-        if servers is not None and servers.kind == "object":
+        if servers is not None:
             doc.kind = "client_config"
             doc.flavor = {"claude_desktop_config.json": "claude_desktop", ".mcp.json": "mcp_json"}.get(
                 base, "mcp_servers")
+            doc.containers = [servers]
             doc.servers = _entries(servers)
             return True
         mcp = root.get("mcp")
         if mcp is not None and mcp.kind == "object":
             vs = mcp.get("servers")
-            if vs is not None and vs.kind == "object":
+            if vs is not None:
                 doc.kind, doc.flavor = "client_config", "vscode_settings"
+                doc.containers = [vs]
                 doc.servers = _entries(vs)
                 return True
         vs = root.get("servers")
@@ -333,6 +337,7 @@ def classify(doc: SourceDoc) -> bool:
             entries = _entries(vs)
             if base == "mcp.json" or (entries and all(_looks_like_server(e.node) for e in entries)):
                 doc.kind, doc.flavor = "client_config", "vscode_mcp"
+                doc.containers = [vs]
                 doc.servers = entries
                 return True
         tools = root.get("tools")
@@ -342,6 +347,7 @@ def classify(doc: SourceDoc) -> bool:
                 tools = result.get("tools")
         if tools is not None and tools.kind == "array":
             doc.kind, doc.flavor = "tool_manifest", "tool_manifest"
+            doc.containers = [tools]
             doc.tools = _tool_entries(tools)
             return True
     if root.kind == "array" and root.value and all(
@@ -350,6 +356,7 @@ def classify(doc: SourceDoc) -> bool:
         for el in root.elements()
     ):
         doc.kind, doc.flavor = "tool_manifest", "tool_manifest"
+        doc.containers = [root]
         doc.tools = _tool_entries(root)
         return True
     return False
@@ -368,7 +375,10 @@ class DiscoveryResult:
 
 def load_file(path: str) -> SourceDoc:
     """Read and parse one file. Raises ParseError / OSError."""
-    size = os.path.getsize(path)
+    st = os.stat(path)  # stat before open: never block on a FIFO or device
+    if not stat.S_ISREG(st.st_mode):
+        raise ParseError("not a regular file")
+    size = st.st_size
     if size > MAX_FILE_BYTES:
         raise ParseError(f"file larger than {MAX_FILE_BYTES} bytes")
     with open(path, "rb") as fh:
@@ -406,7 +416,7 @@ def discover(paths: list[str]) -> DiscoveryResult:
         try:
             doc = load_file(path)
         except (ParseError, OSError) as exc:
-            if explicit or name in WELL_KNOWN_NAMES:
+            if explicit or name in WELL_KNOWN_NAMES or str(exc) == "not a regular file":
                 res.errors.append({"file": path, "message": str(exc)})
             else:
                 res.skipped.append({"file": path, "reason": f"not parseable: {exc}"})
@@ -420,8 +430,8 @@ def discover(paths: list[str]) -> DiscoveryResult:
         if os.path.isdir(p):
             for fp, _name in _iter_dir(p):
                 handle(fp, explicit=False)
-        elif os.path.isfile(p):
-            handle(p, explicit=True)
+        elif os.path.exists(p):
+            handle(p, explicit=True)  # regular file, or a FIFO/device reported by load_file
         else:
             res.errors.append({"file": p, "message": "path does not exist"})
     return res
