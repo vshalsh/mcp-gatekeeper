@@ -169,6 +169,9 @@ def render_text(result: ScanResult, out: TextIO, color: bool = False) -> None:
     code = result.exit_code
     verdict = {EXIT_OK: ("PASS", _SEV_COLOR[Severity.INFO]), EXIT_FINDINGS: ("FAIL", "1;31"),
                EXIT_ERROR: ("ERROR", "1;31")}[code]
+    if code == EXIT_OK and result.fail_on is None and result.findings:
+        # --fail-on none: findings were reported, not judged, so do not claim PASS.
+        verdict = ("REPORT", _SEV_COLOR[max(f.severity for f in result.findings)])
     threshold = result.fail_on.label if result.fail_on is not None else "none"
     out.write(f"\n{paint(verdict[1], verdict[0])}  {len(result.findings)} finding(s): {parts}  "
               f"(fail-on: {threshold}, exit {code})\n")

@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "files-mac": {
+      "command": "/usr/local/bin/fs-server",
+      "args": ["/Users/priya"]
+    },
+    "files-linux": {
+      "command": "/usr/local/bin/fs-server",
+      "args": ["/home/priya"]
+    },
+    "files-windows": {
+      "command": "C:\\Program Files\\fs-server\\fs-server.exe",
+      "args": ["C:\\Users\\priya"]
+    },
+    "files-root": {
+      "command": "/usr/local/bin/fs-server",
+      "args": ["/root"]
+    }
+  }
+}

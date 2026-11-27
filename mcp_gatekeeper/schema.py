@@ -25,7 +25,7 @@ FINDING_SCHEMA: dict = {
     "required": ["rule", "severity", "title", "message", "file", "json_path", "line", "column",
                  "matched_text", "redacted", "server", "tool", "remediation"],
     "properties": {
-        "rule": {"type": "string", "enum": ["GK01", "GK02", "GK03", "GK04", "GK05", "GK06"]},
+        "rule": {"type": "string", "enum": ["GK00", "GK01", "GK02", "GK03", "GK04", "GK04R", "GK05", "GK06"]},
         "severity": {"type": "string", "enum": SEVERITY_LABELS},
         "title": {"type": "string"},
         "message": {"type": "string"},

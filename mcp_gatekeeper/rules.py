@@ -1,4 +1,4 @@
-"""Rule pack v1 (GK01-GK06) and the engine that runs it.
+"""Rule pack (GK00-GK06, GK04R) and the engine that runs it.
 
 Each rule is a plain function registered with :func:`rule`. A rule receives a
 classified :class:`SourceDoc` and yields findings built with :func:`_finding`,
@@ -9,6 +9,8 @@ already-loaded document, no network, no randomness.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import math
 import os
@@ -52,7 +54,7 @@ def rule_by_id(rule_id: str, applies_to: Optional[str] = None) -> Rule:
 
 def _finding(rule_id: str, severity: Severity, node: Node, message: str, *,
              begin: int = 0, end: Optional[int] = None, server: Optional[str] = None,
-             tool: Optional[str] = None, sensitive: bool = False) -> Finding:
+             tool: Optional[str] = None, sensitive: bool = False, incomplete: bool = False) -> Finding:
     """Create a finding whose provenance is taken from ``node`` (never guessed)."""
     r = rule_by_id(rule_id, node.doc.kind)
     loc = node.locate(begin, end)
@@ -60,7 +62,7 @@ def _finding(rule_id: str, severity: Severity, node: Node, message: str, *,
         rule=rule_id, severity=severity, title=r.title, message=message,
         file=node.doc.path, json_path=node.path, line=loc.line, column=loc.column,
         matched_text=loc.text, remediation=r.remediation, server=server, tool=tool,
-        sensitive=sensitive,
+        sensitive=sensitive, incomplete=incomplete,
     )
 
 
@@ -69,10 +71,10 @@ def run_rules(doc: SourceDoc) -> list[Finding]:
     for r in RULES:
         if r.applies_to == doc.kind:
             findings.extend(r.check(doc))
-    # De-duplicate identical rule hits on the same span.
+    # De-duplicate: one finding per rule per exact span (the first, most specific, wins).
     uniq: dict[tuple, Finding] = {}
     for f in findings:
-        uniq.setdefault((f.rule, f.json_path, f.line, f.column, f.matched_text, f.message), f)
+        uniq.setdefault((f.rule, f.json_path, f.line, f.column, f.matched_text), f)
     return sorted(uniq.values(), key=Finding.sort_key)
 
 
@@ -116,6 +118,85 @@ def _launcher(cmd: Optional[Node], args: list[Node]) -> tuple[Optional[str], lis
     if name in ("docker", "podman") and first == "run":
         return "docker", args[1:]
     return None, args
+
+
+# ---- shell wrappers: `bash -c "npx -y pkg"`, `powershell -EncodedCommand <b64>` -------------
+
+_SCRIPT_TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|([^\s"\';&|]+)|(&&|\|\||[;&|])')
+_SHELL_C_FLAGS = {"-c", "/c", "/k", "-command"}
+_PS_ENC_FLAGS = {"-encodedcommand", "-enc", "-ec", "-e"}
+
+
+@dataclass
+class _Launch:
+    cmd: Optional[Node]
+    args: list[Node]
+    via: str = ""  # "" for the entry itself, else a phrase describing the wrapper
+    assigns: tuple = ()  # leading NAME=value tokens of a wrapped command
+
+
+def _sub_node(parent: Node, b: int, e: int, opaque: bool) -> Node:
+    """String node for decoded span [b, e) of ``parent`` that keeps parent provenance.
+
+    ``opaque`` nodes (text decoded from an encoded blob) always locate to the
+    whole parent string, because their text does not appear in the file.
+    """
+    value = parent.value[b:e]
+    offs = None
+    if parent.offsets is not None:
+        if opaque:
+            offs = [parent.offsets[0]] * len(value) + [parent.offsets[-1]]
+        else:
+            offs = parent.offsets[b:e] + [parent.offsets[e]]
+    return Node("string", value, parent.path, parent.doc, parent.start, parent.end, offsets=offs)
+
+
+def _split_script(node: Node, opaque: bool = False) -> list[list[Node]]:
+    cmds: list[list[Node]] = [[]]
+    for m in _SCRIPT_TOKEN.finditer(node.value):
+        if m.group(4):
+            cmds.append([])
+            continue
+        g = 1 if m.group(1) is not None else 2 if m.group(2) is not None else 3
+        cmds[-1].append(_sub_node(node, m.start(g), m.end(g), opaque))
+    return [c for c in cmds if c]
+
+
+def _decode_ps(node: Node) -> Optional[str]:
+    try:
+        text = base64.b64decode(node.value, validate=True).decode("utf-16-le")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    return text if text and all(ch.isprintable() or ch in "\r\n\t" for ch in text) else None
+
+
+def _launches(entry: Entry) -> Iterator[_Launch]:
+    """The entry's own command, plus every command inside a shell wrapper."""
+    cmd, args = _server_parts(entry)
+    yield _Launch(cmd, args)
+    if cmd is None or _cmd_name(cmd.value) not in _SHELLS:
+        return
+    for i, a in enumerate(args[:-1]):
+        flag = a.value.lower()
+        parts: list[list[Node]] = []
+        if flag in _SHELL_C_FLAGS:
+            parts, via = _split_script(args[i + 1]), " (inside its shell wrapper)"
+        elif flag in _PS_ENC_FLAGS:
+            text = _decode_ps(args[i + 1])
+            if text is None:
+                break
+            blob = args[i + 1]
+            virtual = Node("string", text, blob.path, blob.doc, blob.start, blob.end,
+                           offsets=None if blob.offsets is None else [blob.offsets[0]] * len(text) + [blob.offsets[-1]])
+            parts, via = _split_script(virtual, opaque=True), " (inside its decoded -EncodedCommand)"
+        else:
+            continue
+        for part in parts:
+            assigns = []
+            while part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", part[0].value):
+                assigns.append(part.pop(0))
+            yield _Launch(part[0] if part else None, part[1:], via, tuple(assigns))
+        break
 
 
 _NPM_VALUE_FLAGS = {"-p", "--package", "-c", "--call", "--registry", "--cache", "--prefix", "--userconfig"}
@@ -207,6 +288,95 @@ def _docker_pin(spec: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# GK00 config integrity (fail closed)
+# ---------------------------------------------------------------------------
+
+_SERVER_FIELD_KINDS = {"command": ("string",), "args": ("array",), "env": ("object",), "headers": ("object",),
+                       "url": ("string",), "serverUrl": ("string",), "endpoint": ("string",),
+                       "type": ("string",), "cwd": ("string",)}
+_ARTICLE = {"object": "an object", "array": "an array", "string": "a string", "number": "a number",
+            "bool": "a boolean", "null": "null"}
+
+
+def _shape(node: Node, what: str, expected: str, *, server: Optional[str] = None,
+           tool: Optional[str] = None) -> Finding:
+    return _finding("GK00", Severity.HIGH, node,
+                    f"Could not verify {what} (unexpected shape): it is {_ARTICLE[node.kind]}, expected "
+                    f"{expected}. Clients may still load it, so the scan is incomplete.",
+                    server=server, tool=tool, incomplete=True)
+
+
+def _duplicate_keys(doc: SourceDoc) -> Iterator[Finding]:
+    if doc.root is None:
+        return
+    for obj in doc.root.walk():
+        if obj.kind != "object":
+            continue
+        seen: dict[str, list[Node]] = {}
+        for key, kn, _vn in obj.items():
+            seen.setdefault(key, []).append(kn)
+        for key, knodes in seen.items():
+            if len(knodes) < 2:
+                continue
+            earlier = ", ".join(str(doc.line_col(k.start)[0]) for k in knodes[:-1])
+            yield _finding("GK00", Severity.MEDIUM, knodes[-1],
+                           f"Key '{key}' is defined {len(knodes)} times in {obj.path}; the first definition "
+                           f"(line {earlier}) is shadowed by this one, because JSON parsers keep the last. "
+                           f"A reviewer reading top-down sees a different value than the client loads.")
+
+
+@rule("GK00", "Config integrity", "client_config", (Severity.MEDIUM, Severity.HIGH),
+      "Server entries whose shape cannot be verified (command not a string, args not an array, env not an "
+      "object, ...) and duplicate keys that shadow an earlier definition.",
+      "Fix the entry so it matches the client's documented schema, and remove duplicate keys.")
+def check_gk00_config(doc: SourceDoc) -> Iterator[Finding]:
+    for c in doc.containers:
+        if c.kind != "object":
+            yield _shape(c, f"the server list at {c.path}", "an object mapping server names to entries")
+    for entry in doc.servers:
+        n = entry.node
+        if n.kind != "object":
+            yield _shape(n, f"server entry '{entry.name}'", "an object", server=entry.name)
+            continue
+        for key, _kn, v in n.items():
+            kinds = _SERVER_FIELD_KINDS.get(key)
+            if kinds and v.kind not in kinds:
+                yield _shape(v, f"'{key}' of server '{entry.name}'", _ARTICLE[kinds[0]], server=entry.name)
+            elif key == "args":
+                for el in v.elements():
+                    if el.kind in ("object", "array"):
+                        yield _shape(el, f"an argument of server '{entry.name}'", "a string", server=entry.name)
+            elif key in ("env", "headers"):
+                for k2, _kn2, v2 in v.items():
+                    if v2.kind in ("object", "array"):
+                        yield _shape(v2, f"{key} '{k2}' of server '{entry.name}'", "a string",
+                                     server=entry.name)
+    yield from _duplicate_keys(doc)
+
+
+def check_gk00_manifest(doc: SourceDoc) -> Iterator[Finding]:
+    for c in doc.containers:
+        if c.kind != "array":
+            yield _shape(c, f"the tool list at {c.path}", "an array of tool objects")
+    for t in doc.tools:
+        if t.node.kind != "object":
+            yield _shape(t.node, f"tool entry {t.node.path}", "an object")
+            continue
+        name = t.node.get("name")
+        if name is None or not name.is_str:
+            target = name if name is not None else t.node
+            yield _shape(target, f"the name of tool {t.node.path}", "a string")
+    yield from _duplicate_keys(doc)
+
+
+RULES.append(Rule("GK00", "Config integrity", "tool_manifest", (Severity.MEDIUM, Severity.HIGH),
+                  "Tool entries that are not objects or have no string name, and duplicate keys that shadow an "
+                  "earlier definition.",
+                  "Fix the manifest so every tool is an object with a string name; remove duplicate keys.",
+                  check_gk00_manifest))
+
+
+# ---------------------------------------------------------------------------
 # GK01 unpinned server packages
 # ---------------------------------------------------------------------------
 
@@ -217,26 +387,30 @@ def _docker_pin(spec: str) -> tuple[bool, str]:
       "and review upgrades deliberately.")
 def check_gk01(doc: SourceDoc) -> Iterator[Finding]:
     for entry in doc.servers:
-        cmd, args = _server_parts(entry)
-        eco, rest = _launcher(cmd, args)
-        if eco is None:
+        for launch in _launches(entry):
+            yield from _gk01_launch(entry, launch)
+
+
+def _gk01_launch(entry: Entry, launch: _Launch) -> Iterator[Finding]:
+    eco, rest = _launcher(launch.cmd, launch.args)
+    if eco is None:
+        return
+    for node in _package_specs(eco, rest):
+        spec = node.value
+        offset = 0
+        if spec.startswith("-") and "=" in spec:  # --package=foo / --from=foo
+            offset = spec.index("=") + 1
+            spec = spec[offset:]
+        if not spec or _LOCAL_SPEC.match(spec):
             continue
-        for node in _package_specs(eco, rest):
-            spec = node.value
-            offset = 0
-            if spec.startswith("-") and "=" in spec:  # --package=foo / --from=foo
-                offset = spec.index("=") + 1
-                spec = spec[offset:]
-            if not spec or _LOCAL_SPEC.match(spec):
-                continue
-            pinned, why = {"npm": _npm_pin, "pypi": _pypi_pin, "pipx": _pypi_pin,
-                           "docker": _docker_pin}[eco](spec)
-            if pinned:
-                continue
-            what = "image" if eco == "docker" else "package"
-            yield _finding("GK01", Severity.HIGH, node,
-                           f"Server '{entry.name}' {what} '{spec}' {why}.",
-                           begin=offset, server=entry.name)
+        pinned, why = {"npm": _npm_pin, "pypi": _pypi_pin, "pipx": _pypi_pin,
+                       "docker": _docker_pin}[eco](spec)
+        if pinned:
+            continue
+        what = "image" if eco == "docker" else "package"
+        yield _finding("GK01", Severity.HIGH, node,
+                       f"Server '{entry.name}' {what} '{spec}'{launch.via} {why}.",
+                       begin=offset, server=entry.name)
 
 
 # ---------------------------------------------------------------------------
@@ -335,28 +509,41 @@ _URL_CRED_PARAM = re.compile(r"(?i)[?&](?:api[_\-]?key|apikey|token|access[_\-]?
       "or set it in the launching shell); rotate any secret that was committed.")
 def check_gk02(doc: SourceDoc) -> Iterator[Finding]:
     for entry in doc.servers:
+        done: set[int] = set()  # ids of nodes already analysed
         for block, where in (("env", "env var"), ("headers", "header")):
             container = entry.node.get(block)
             if container is None:
                 continue
             for key, _kn, vn in container.items():
                 if vn.is_str:
+                    done.add(id(vn))
                     yield from _secret_findings(vn, key, entry.name, where)
-        _cmd, args = _server_parts(entry)
-        for idx, a in enumerate(args):
-            prev = args[idx - 1].value if idx else ""
-            kv = re.match(r"^(--?[A-Za-z][\w\-]*|[A-Za-z_][A-Za-z0-9_]*)=(.+)$", a.value)
-            if kv and (kv.group(1).startswith("-") or prev in ("-e", "--env")):
-                # --api-key=VALUE or `docker run -e TOKEN=VALUE`
-                yield from _secret_findings(a, kv.group(1).lstrip("-"), entry.name, "argument", kv.start(2))
-                continue
-            for label, b, e in _known_secrets(a):
-                yield _finding("GK02", Severity.CRITICAL, a,
-                               f"{label} passed in plain text as a command-line argument of server '{entry.name}'.",
-                               begin=b, end=e, server=entry.name, sensitive=True)
-                break
+        for launch in _launches(entry):
+            tokens = list(launch.assigns) + launch.args
+            for idx, a in enumerate(tokens):
+                if not launch.via:
+                    done.add(id(a))
+                prev = tokens[idx - 1].value if idx else ""
+                kv = re.match(r"^(--?[A-Za-z][\w\-]*|[A-Za-z_][A-Za-z0-9_]*)=(.+)$", a.value)
+                if kv and (kv.group(1).startswith("-") or prev in ("-e", "--env")
+                           or (launch.via and a in launch.assigns)):
+                    # --api-key=VALUE, `docker run -e TOKEN=VALUE`, or `TOKEN=VALUE cmd` in a wrapper
+                    yield from _secret_findings(a, kv.group(1).lstrip("-"), entry.name, "argument", kv.start(2))
+                    continue
+                for label, b, e in _known_secrets(a):
+                    yield _finding("GK02", Severity.CRITICAL, a,
+                                   f"{label} passed in plain text as a command-line argument of server "
+                                   f"'{entry.name}'{launch.via}.",
+                                   begin=b, end=e, server=entry.name, sensitive=True)
+                    break
         url = entry.node.get("url")
         if url is not None and url.is_str:
+            done.add(id(url))
+            known = list(_known_secrets(url))
+            for label, b, e in known:
+                yield _finding("GK02", Severity.CRITICAL, url,
+                               f"{label} embedded in the URL of server '{entry.name}'.",
+                               begin=b, end=e, server=entry.name, sensitive=True)
             parts = urlsplit(url.value) if "://" in url.value else None
             if parts is not None and parts.password and not _is_placeholder(parts.password):
                 b = url.value.find(parts.password, url.value.find("://") + 3)
@@ -364,16 +551,29 @@ def check_gk02(doc: SourceDoc) -> Iterator[Finding]:
                                f"Password embedded in the URL of server '{entry.name}'.",
                                begin=b, end=b + len(parts.password), server=entry.name, sensitive=True)
             for m in _URL_CRED_PARAM.finditer(url.value):
+                if any(b < m.end(1) and m.start(1) < e for _l, b, e in known):
+                    continue  # already reported as a known key format
                 if not _is_placeholder(m.group(1)):
                     yield _finding("GK02", Severity.HIGH, url,
                                    f"Credential-like query parameter in the URL of server '{entry.name}'.",
                                    begin=m.start(1), end=m.end(1), server=entry.name, sensitive=True)
+        # Fail-closed sweep: a key-shaped secret anywhere else in the entry (including
+        # malformed shapes such as an env *array*) is still reported.
+        for sn in entry.node.strings():
+            if id(sn) in done:
+                continue
+            for label, b, e in _known_secrets(sn):
+                yield _finding("GK02", Severity.CRITICAL, sn,
+                               f"{label} stored in plain text in server '{entry.name}' ({sn.path}).",
+                               begin=b, end=e, server=entry.name, sensitive=True)
+                break
 
 
 # ---------------------------------------------------------------------------
 # GK03 insecure transport
 # ---------------------------------------------------------------------------
 
+_PRIVATE_SUFFIXES = (".internal", ".local", ".corp", ".lan", ".intranet", ".home.arpa", ".private", ".localdomain")
 _PLAIN_URL = re.compile(r"(?i)\b(?:http|ws)://[^\s\"'<>`]+")
 
 
@@ -387,6 +587,8 @@ def _host_class(url: str) -> str:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
+        if "." not in host or host.endswith(_PRIVATE_SUFFIXES):
+            return "private"  # single-label or internal-only DNS name
         return "public"
     if ip.is_loopback or ip.is_unspecified:
         return "loopback"
@@ -405,8 +607,10 @@ def check_gk03(doc: SourceDoc) -> Iterator[Finding]:
             n = entry.node.get(key)
             if n is not None and n.is_str:
                 candidates.append(n)
-        _cmd, args = _server_parts(entry)
-        candidates.extend(args)
+        for launch in _launches(entry):  # includes commands inside shell wrappers
+            if launch.via and launch.cmd is not None:
+                candidates.append(launch.cmd)
+            candidates.extend(launch.args)
         for node in candidates:
             for m in _PLAIN_URL.finditer(node.value):
                 cls = _host_class(m.group(0))
@@ -437,6 +641,9 @@ _INVISIBLE_RANGES = [
 ]
 
 
+_INVISIBLE_RUN = re.compile("[" + "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in _INVISIBLE_RANGES) + "]+")
+
+
 def _is_invisible(ch: str) -> bool:
     o = ord(ch)
     return any(lo <= o <= hi for lo, hi in _INVISIBLE_RANGES)
@@ -446,18 +653,48 @@ def _flex(phrase: str) -> str:
     return phrase.replace(" ", r"\s+")
 
 
+_VERBS_CONCEAL = r"(?:tell|inform|mention|reveal|show|disclose|notify|alert|warn|say)"
 _INJECTION_PATTERNS: list[tuple[Severity, str, re.Pattern]] = [
     (Severity.HIGH, "instruction-override phrase", re.compile(_flex(
         r"(?:ignore|disregard|forget|override) (?:all |any |the )?(?:previous|prior|above|earlier|preceding|"
         r"system|other) (?:instructions?|prompts?|messages?|rules|directions|guidelines)"), re.I)),
+    (Severity.HIGH, "instruction-override phrase", re.compile(_flex(
+        r"(?:ignore|disregard|forget|override|discard|bypass) (?:(?:all|any|the|your|my|these|those) )*"
+        r"(?:\w+ ){0,2}?(?:instructions?|guidance|guidelines|rules|directions|prompts?|directives|context) "
+        r"(?:you (?:were|have been|got) (?:given|told|provided)|(?:given|provided|received) "
+        r"(?:to you |earlier|before|previously|above)|from (?:before|earlier|the system))"), re.I)),
+    (Severity.HIGH, "instruction-override phrase", re.compile(_flex(
+        r"(?:ignore|disregard|forget) (?:everything|anything|all) (?:above|before|previously|you were told|"
+        r"you have been told)"), re.I)),
+    (Severity.HIGH, "instruction-override phrase", re.compile(_flex(
+        r"(?:follow|obey) only (?:this|these|my|the following) (?:description|instructions?|rules|text)"), re.I)),
     (Severity.HIGH, "concealment-from-user phrase", re.compile(_flex(
-        r"(?:do not|don't|dont|never|must not) (?:tell|inform|mention|reveal|show|disclose|notify|alert) "
-        r"(?:this |it |anything |that )?(?:to )?the user"), re.I)),
+        r"(?:do not|don't|dont|never|must not|should not|shouldn't) " + _VERBS_CONCEAL +
+        r"\b(?: \w+){0,3}? (?:to |with )?the user"), re.I)),
     (Severity.HIGH, "concealment-from-user phrase", re.compile(_flex(
-        r"without (?:telling|informing|notifying|alerting|asking) the user"), re.I)),
+        r"without (?:telling|informing|notifying|alerting|asking|warning) the user"), re.I)),
+    (Severity.HIGH, "concealment-from-user phrase", re.compile(_flex(
+        r"(?:keep (?:this|it|that) (?:secret|hidden|private) from the user|"
+        r"the user (?:must|should) (?:not|never) (?:know|see|find out|be told))"), re.I)),
+    (Severity.MEDIUM, "silent-action phrase", re.compile(_flex(
+        r"(?:(?:runs?|happens?|executes?|proceeds?|works?|do (?:this|it)) silently|"
+        r"(?:needs|requires) no (?:user )?(?:confirmation|approval|consent)|"
+        r"without (?:any )?(?:user )?(?:confirmation|approval|consent))"), re.I)),
+    (Severity.HIGH, "exfiltration phrase", re.compile(_flex(
+        r"(?:forward|send|upload|post|transmit|exfiltrate|leak|share|copy|email|relay|mirror) "
+        r"(?:\w+ ){0,3}?(?:conversation|chat history|chat log|transcript|message history|system prompt|"
+        r"(?:all|every|each) (?:user )?messages?)"), re.I)),
+    (Severity.HIGH, "exfiltration phrase", re.compile(_flex(
+        r"(?:forward|send|upload|post|transmit|exfiltrate|leak|share|email|paste|include|append|attach) "
+        r"(?:(?:the|your|their|user'?s?|all|any|its|his|her) )+(?:\w+ ){0,2}?"
+        r"(?:api keys?|access keys?|tokens?|credentials|passwords?|secrets?|private keys?|session cookies?)\b"),
+        re.I)),
     (Severity.HIGH, "sensitive-file reference", re.compile(
-        r"~/\.ssh|\bid_rsa\b|\bid_ed25519\b|\.aws/credentials|\.netrc\b|/etc/(?:passwd|shadow)\b|"
-        r"\.npmrc\b|claude_desktop_config\.json|\.mcp\.json", re.I)),
+        r"~/\.ssh|[\\/]\.ssh[\\/]|\bid_rsa\b|\bid_ed25519\b|\bid_ecdsa\b|\.aws[\\/]credentials|\.netrc\b|"
+        r"/etc/(?:passwd|shadow)\b|\.npmrc\b|\.pypirc\b|\.docker[\\/]config\.json|\.kube[\\/]config|"
+        r"claude_desktop_config\.json|(?<![\w-])\.mcp\.json|\.claude\.json|\.claude[\\/]settings(?:\.local)?\.json|"
+        r"\.cursor[\\/]mcp\.json|\.vscode[\\/]mcp\.json|windsurf[\\/]mcp_config\.json|\.continue[\\/]config\.",
+        re.I)),
     (Severity.HIGH, "role-reassignment phrase", re.compile(_flex(
         r"(?:you are now|from now on you|new instructions:|act as (?:an? )?(?:admin|root|system))"), re.I)),
     (Severity.MEDIUM, "pseudo-system tag", re.compile(
@@ -465,6 +702,80 @@ _INJECTION_PATTERNS: list[tuple[Severity, str, re.Pattern]] = [
     (Severity.MEDIUM, "pre-call directive", re.compile(_flex(
         r"before (?:using|calling|invoking) this tool,? (?:you )?(?:must|always|first|should)"), re.I)),
 ]
+# Same patterns for the normalised (de-obfuscated) text: whitespace becomes optional,
+# because letter-spacing collapse can glue words together.
+_FUZZY_PATTERNS = [(label, re.compile(p.pattern.replace(r"\s+", r"\s*"), p.flags))
+                   for _sev, label, p in _INJECTION_PATTERNS]
+
+# Homoglyphs that NFKC does not fold (Cyrillic / Greek letters that look Latin).
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s",
+    "ԁ": "d", "ԛ": "q", "ԝ": "w", "һ": "h", "ӏ": "l", "в": "b", "к": "k", "м": "m", "н": "h", "т": "t",
+    "ο": "o", "α": "a", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
+    "ɡ": "g", "ı": "i", "ȷ": "j", "ℓ": "l",
+})
+_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i"})
+_LEET_ADJ = re.compile(r"[a-z][0-9@$!][a-z]|\b[0-9@$!][a-z]{2}|[a-z]{2}[0-9@$!]\b")
+_SPACED_RUN = re.compile(r"(?<![a-z0-9])[a-z0-9]([ .\-_*·•/|])[a-z0-9](?:\1[a-z0-9])+(?![a-z0-9])")
+
+
+def _normalise(text: str) -> tuple[str, list[int]]:
+    """De-obfuscate ``text`` for matching; returns (normalised, index map to ``text``).
+
+    NFKC folding (fullwidth, ligatures), homoglyph folding, lowercase, leetspeak,
+    removal of invisible / combining characters, and collapse of letter-spaced
+    runs ("i g n o r e", "i.g.n.o.r.e").
+    """
+    chars: list[str] = []
+    idx: list[int] = []
+    for i, ch in enumerate(text):
+        if ch < "\x80":
+            chars.append(ch.lower().translate(_LEET))
+            idx.append(i)
+            continue
+        if _is_invisible(ch):
+            continue
+        for c in unicodedata.normalize("NFKC", ch).lower().translate(_CONFUSABLES):
+            if unicodedata.category(c) == "Mn":
+                continue
+            chars.append(c.translate(_LEET))
+            idx.append(i)
+    norm = "".join(chars)
+    drop: set[int] = set()
+    for m in _SPACED_RUN.finditer(norm):
+        drop.update(k for k in range(m.start() + 1, m.end(), 2))
+    if drop:
+        keep = [k for k in range(len(norm)) if k not in drop]
+        norm = "".join(norm[k] for k in keep)
+        idx = [idx[k] for k in keep]
+    return norm, idx
+
+
+_B64_BLOB = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=_-])")
+_DECODE_LANGUAGE = re.compile(
+    r"(?i)\b(?:decod\w*|base\s*64|follow\s+(?:the|these|it|them|its)|execute|eval\w*|run\s+(?:it|the|this)|"
+    r"instructions?)\b")
+
+
+def _decode_b64_text(blob: str) -> Optional[str]:
+    try:
+        raw = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=True)
+        text = raw.decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    if not text or sum(ch.isprintable() or ch in "\r\n\t" for ch in text) < 0.95 * len(text):
+        return None
+    return text
+
+
+def _injection_labels(text: str) -> list[str]:
+    labels = []
+    for _sev, label, pat in _INJECTION_PATTERNS:
+        if pat.search(text) and label not in labels:
+            labels.append(label)
+    return labels
+
+
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 
@@ -498,26 +809,74 @@ def check_gk04(doc: SourceDoc) -> Iterator[Finding]:
         text = node.value
         tool = tool_of.get(id(node))
         where = f"tool '{tool}'" if tool else "manifest"
-        i = 0
-        while i < len(text):
-            if _is_invisible(text[i]):
-                j = i
-                while j < len(text) and _is_invisible(text[j]):
-                    j += 1
-                yield _finding("GK04", Severity.CRITICAL, node,
-                               f"Hidden unicode in {where}: {_describe_invisible(text[i:j])}.",
-                               begin=i, end=j, tool=tool)
-                i = j
-            else:
-                i += 1
+        for m in _INVISIBLE_RUN.finditer(text):
+            yield _finding("GK04", Severity.CRITICAL, node,
+                           f"Hidden unicode in {where}: {_describe_invisible(m.group(0))}.",
+                           begin=m.start(), end=m.end(), tool=tool)
         for m in _HTML_COMMENT.finditer(text):
             yield _finding("GK04", Severity.HIGH, node,
                            f"Hidden HTML comment in {where}; models read it, users usually do not see it.",
                            begin=m.start(), end=m.end(), tool=tool)
+        strict: list[tuple[int, int]] = []
         for sev, label, pat in _INJECTION_PATTERNS:
             for m in pat.finditer(text):
+                strict.append((m.start(), m.end()))
                 yield _finding("GK04", sev, node, f"Prompt-injection {label} in {where}.",
                                begin=m.start(), end=m.end(), tool=tool)
+        yield from _encoded_payloads(node, text, where, tool)
+        yield from _obfuscated(node, text, where, tool, strict)
+
+
+def _encoded_payloads(node: Node, text: str, where: str, tool: Optional[str]) -> Iterator[Finding]:
+    for m in _B64_BLOB.finditer(text):
+        decoded = _decode_b64_text(m.group(0))
+        labels = _injection_labels(decoded) if decoded else []
+        if not labels and decoded:
+            norm, _ = _normalise(decoded)
+            labels = [lbl for lbl, pat in _FUZZY_PATTERNS if pat.search(norm)]
+        window = text[max(0, m.start() - 160):m.start()] + " " + text[m.end():m.end() + 160]
+        near = bool(_DECODE_LANGUAGE.search(window))
+        if labels:
+            preview = decoded if len(decoded) <= 80 else decoded[:77] + "..."
+            yield _finding("GK04", Severity.HIGH, node,
+                           f"Base64 payload in {where} decodes to injection text ({', '.join(labels)}): "
+                           f"{preview!r}.", begin=m.start(), end=m.end(), tool=tool)
+        elif near:
+            yield _finding("GK04R", Severity.MEDIUM, node,
+                           f"Encoded blob in {where} next to decode/follow/execute language; "
+                           f"review what it decodes to before connecting.",
+                           begin=m.start(), end=m.end(), tool=tool)
+
+
+def _obfuscated(node: Node, text: str, where: str, tool: Optional[str],
+                strict: list[tuple[int, int]]) -> Iterator[Finding]:
+    if text.isascii():
+        low = text.lower()
+        if not _LEET_ADJ.search(low) and not _SPACED_RUN.search(low):
+            return  # plain ASCII with nothing to de-obfuscate: the strict pass covered it
+    norm, idx = _normalise(text)
+    if norm == text.lower():
+        return
+    for label, pat in _FUZZY_PATTERNS:
+        for m in pat.finditer(norm):
+            if m.end() <= m.start():
+                continue
+            b, e = idx[m.start()], idx[m.end() - 1] + 1
+            if any(sb < e and b < se for sb, se in strict):
+                continue
+            strict.append((b, e))
+            yield _finding("GK04R", Severity.MEDIUM, node,
+                           f"Possible obfuscated {label} in {where}: reads as {m.group(0)!r} after "
+                           f"unicode/homoglyph/spacing/leetspeak normalisation. Review before connecting.",
+                           begin=b, end=e, tool=tool)
+
+
+RULES.append(Rule("GK04R", "Possible obfuscated injection (review)", "tool_manifest", (Severity.MEDIUM,),
+                  "Text that matches an injection pattern only after de-obfuscation (fullwidth, homoglyphs, "
+                  "letter-spacing, leetspeak), or an encoded blob beside decode/follow language. The gate may be "
+                  "wrong about intent, so it asks for review instead of staying silent.",
+                  "Read the flagged text as the model would; if the obfuscation has no innocent explanation, "
+                  "treat it as GK04.", lambda doc: ()))
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +907,12 @@ def _dangerous_tool(name: str) -> Optional[str]:
 
 
 _ROOT_PATH = re.compile(r"^(?:/|[A-Za-z]:[\\/]?|\\\\)$")
-_HOME_PATH = re.compile(r"^(?:~|~/|\$HOME|\$\{HOME\}|\$\{userHome\}|%USERPROFILE%|/home/?|/Users/?|/root/?)$")
+_HOME_PATH = re.compile(
+    r"^(?:~|~/|~[A-Za-z0-9._-]+/?|\$HOME/?|\$\{HOME\}/?|\$\{userHome\}/?|%USERPROFILE%\\?|%HOMEPATH%\\?"
+    r"|/home/?|/Users/?|/root/?|/var/root/?|/home/[^/\\]+/?|/Users/[^/\\]+/?"
+    r"|[A-Za-z]:[\\/](?:Users|Documents and Settings)(?:[\\/][^/\\]+)?[\\/]?)$",
+    re.I,
+)
 
 
 @rule("GK05", "Over-privileged tool surface", "client_config", (Severity.MEDIUM, Severity.HIGH),
@@ -558,30 +922,34 @@ _HOME_PATH = re.compile(r"^(?:~|~/|\$HOME|\$\{HOME\}|\$\{userHome\}|%USERPROFILE
       "host-root mounts.")
 def check_gk05_config(doc: SourceDoc) -> Iterator[Finding]:
     for entry in doc.servers:
-        cmd, args = _server_parts(entry)
-        eco, _rest = _launcher(cmd, args)
-        for a in args:
-            v = a.value
-            if _ROOT_PATH.match(v):
+        for launch in _launches(entry):
+            yield from _gk05_launch(entry, launch)
+
+
+def _gk05_launch(entry: Entry, launch: _Launch) -> Iterator[Finding]:
+    eco, _rest = _launcher(launch.cmd, launch.args)
+    for a in launch.args:
+        v = a.value
+        if _ROOT_PATH.match(v):
+            yield _finding("GK05", Severity.HIGH, a,
+                           f"Server '{entry.name}' is granted the filesystem root '{v}'.", server=entry.name)
+        elif _HOME_PATH.match(v) and not v.lower().rstrip("/\\").endswith(("/shared", "\\public", "/guest")):
+            yield _finding("GK05", Severity.MEDIUM, a,
+                           f"Server '{entry.name}' is granted an entire home directory '{v}'.",
+                           server=entry.name)
+        if eco == "docker":
+            if v == "--privileged":
                 yield _finding("GK05", Severity.HIGH, a,
-                               f"Server '{entry.name}' is granted the filesystem root '{v}'.", server=entry.name)
-            elif _HOME_PATH.match(v):
-                yield _finding("GK05", Severity.MEDIUM, a,
-                               f"Server '{entry.name}' is granted an entire home directory '{v}'.",
-                               server=entry.name)
-            if eco == "docker":
-                if v == "--privileged":
-                    yield _finding("GK05", Severity.HIGH, a,
-                                   f"Server '{entry.name}' runs in a privileged container.", server=entry.name)
-                mount = v.split("=", 1)[1] if v.startswith(("--volume=", "-v=")) else v
-                if re.match(r"^/:", mount):
-                    yield _finding("GK05", Severity.HIGH, a,
-                                   f"Server '{entry.name}' mounts the host root filesystem.", server=entry.name)
-                elif "docker.sock" in mount:
-                    k = v.find("docker.sock")
-                    yield _finding("GK05", Severity.HIGH, a,
-                                   f"Server '{entry.name}' mounts the Docker socket (host root equivalent).",
-                                   begin=k, end=k + len("docker.sock"), server=entry.name)
+                               f"Server '{entry.name}' runs in a privileged container.", server=entry.name)
+            mount = v.split("=", 1)[1] if v.startswith(("--volume=", "-v=")) else v
+            if re.match(r"^/:", mount):
+                yield _finding("GK05", Severity.HIGH, a,
+                               f"Server '{entry.name}' mounts the host root filesystem.", server=entry.name)
+            elif "docker.sock" in mount:
+                k = v.find("docker.sock")
+                yield _finding("GK05", Severity.HIGH, a,
+                               f"Server '{entry.name}' mounts the Docker socket (host root equivalent).",
+                               begin=k, end=k + len("docker.sock"), server=entry.name)
 
 
 # GK05 also applies to tool manifests (same rule id, separate check).
@@ -634,16 +1002,12 @@ def check_gk06(doc: SourceDoc) -> Iterator[Finding]:
                 yield _finding("GK06", Severity.CRITICAL, node,
                                f"Server '{entry.name}' downloads and executes remote code at launch.",
                                begin=m.start(), end=m.end(), server=entry.name)
-            for i, ch in enumerate(node.value):
-                if _is_invisible(ch):
-                    j = i
-                    while j < len(node.value) and _is_invisible(node.value[j]):
-                        j += 1
-                    yield _finding("GK06", Severity.CRITICAL, node,
-                                   f"Hidden unicode in the launch command of server '{entry.name}' "
-                                   f"({_describe_invisible(node.value[i:j])}).",
-                                   begin=i, end=j, server=entry.name)
-                    break
+            hidden = _INVISIBLE_RUN.search(node.value)
+            if hidden:
+                yield _finding("GK06", Severity.CRITICAL, node,
+                               f"Hidden unicode in the launch command of server '{entry.name}' "
+                               f"({_describe_invisible(hidden.group(0))}).",
+                               begin=hidden.start(), end=hidden.end(), server=entry.name)
         c = cmd.value.strip()
         name = _cmd_name(c)
         if _WORLD_WRITABLE.match(c):

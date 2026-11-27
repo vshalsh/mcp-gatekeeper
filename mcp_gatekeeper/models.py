@@ -76,6 +76,7 @@ class SourceDoc:
     flavor: str = ""  # e.g. "claude_desktop", "mcp_json", "vscode_settings"
     servers: list["Entry"] = field(default_factory=list)
     tools: list["Entry"] = field(default_factory=list)
+    containers: list["Node"] = field(default_factory=list)  # mcpServers / servers / tools nodes
     _line_starts: list[int] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
@@ -219,6 +220,7 @@ class Finding:
     tool: Optional[str] = None
     sensitive: bool = False  # matched_text is (probably) a live secret
     redacted: bool = False
+    incomplete: bool = False  # entry could not be verified: the scan is incomplete (exit 2)
 
     def sort_key(self) -> tuple:
         return (self.file, self.line, self.column, self.rule, self.json_path)
