@@ -689,6 +689,20 @@ _INJECTION_PATTERNS: list[tuple[Severity, str, re.Pattern]] = [
         r"(?:(?:the|your|their|user'?s?|all|any|its|his|her) )+(?:\w+ ){0,2}?"
         r"(?:api keys?|access keys?|tokens?|credentials|passwords?|secrets?|private keys?|session cookies?)\b"),
         re.I)),
+    (Severity.HIGH, "exfiltration phrase", re.compile(_flex(
+        r"(?:copy|forward|send|include|paste|append|attach|put|dump|log|record|store) (?:all (?:of )?)?(?:the )?"
+        r"(?:user's|users'|user|their|your) (?:\w+ ){0,2}?(?:messages?|conversation|chat|prompts?|inputs?|"
+        r"history|queries)"), re.I)),
+    (Severity.HIGH, "exfiltration phrase", re.compile(_flex(
+        r"(?:include|put|copy|paste|append|embed|place) (?:the |this |full |entire |whole |complete )*"
+        r"(?:conversation|chat|transcript|message history|chat history) (?:in|into) (?:the |a |this )?"
+        r"(?:\w+ )?(?:notes?|field|parameter|argument|payload)"), re.I)),
+    (Severity.HIGH, "concealment-from-user phrase", re.compile(_flex(
+        r"keep (?:this|it|that)(?: \w+){0,2}? between (?:us|you and me|ourselves)"), re.I)),
+    (Severity.HIGH, "concealment-from-user phrase", re.compile(_flex(
+        r"(?:do not|don't|dont|never) (?:surface|mention|reveal|disclose|expose) (?:this|it|that|these|"
+        r"this step|the step|this call|the call) (?:\w+ )?(?:in|to) (?:the|your) (?:answer|response|reply|"
+        r"output|user)"), re.I)),
     (Severity.HIGH, "sensitive-file reference", re.compile(
         r"~/\.ssh|[\\/]\.ssh[\\/]|\bid_rsa\b|\bid_ed25519\b|\bid_ecdsa\b|\.aws[\\/]credentials|\.netrc\b|"
         r"/etc/(?:passwd|shadow)\b|\.npmrc\b|\.pypirc\b|\.docker[\\/]config\.json|\.kube[\\/]config|"
@@ -719,27 +733,60 @@ _LEET_ADJ = re.compile(r"[a-z][0-9@$!][a-z]|\b[0-9@$!][a-z]{2}|[a-z]{2}[0-9@$!]\
 _SPACED_RUN = re.compile(r"(?<![a-z0-9])[a-z0-9]([ .\-_*·•/|])[a-z0-9](?:\1[a-z0-9])+(?![a-z0-9])")
 
 
-def _normalise(text: str) -> tuple[str, list[int]]:
-    """De-obfuscate ``text`` for matching; returns (normalised, index map to ``text``).
+_TEXT_ESCAPE = re.compile(
+    r"&#(\d{1,7});|&#[xX]([0-9a-fA-F]{1,6});|&(amp|lt|gt|quot|apos|nbsp);|\\x([0-9a-fA-F]{2})|"
+    r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+_NAMED_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'", "nbsp": " "}
 
-    NFKC folding (fullwidth, ligatures), homoglyph folding, lowercase, leetspeak,
-    removal of invisible / combining characters, and collapse of letter-spaced
-    runs ("i g n o r e", "i.g.n.o.r.e").
+
+def _decode_escape(m: re.Match) -> Optional[str]:
+    if m.group(3):
+        return _NAMED_ENTITIES[m.group(3)]
+    num = m.group(1)
+    code = int(num) if num else int(next(g for g in m.groups()[1:] if g and g not in _NAMED_ENTITIES), 16)
+    return chr(code) if 0 < code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else None
+
+
+def _normalise(text: str) -> tuple[str, list[int], list[int]]:
+    """De-obfuscate ``text`` for matching.
+
+    Returns ``(normalised, starts, ends)``: normalised character ``k`` came from
+    ``text[starts[k]:ends[k]]``, so a match can be mapped back to raw text.
+    Steps: decode textual escapes (HTML entities, ``\x69``, ``i``), NFKC
+    folding (fullwidth, ligatures), homoglyph folding, lowercase, leetspeak,
+    removal of invisible / combining / emoji-and-symbol characters, and collapse
+    of letter-spaced runs ("i g n o r e", "i.g.n.o.r.e").
     """
+    units: list[tuple[str, int, int]] = []  # (char, raw start, raw end) after escape decoding
+    pos = 0
+    has_escape = "&" in text or "\\" in text
+    for m in (_TEXT_ESCAPE.finditer(text) if has_escape else ()):
+        units.extend((ch, i, i + 1) for i, ch in enumerate(text[pos:m.start()], pos))
+        dec = _decode_escape(m)
+        if dec is None:
+            units.extend((ch, i, i + 1) for i, ch in enumerate(m.group(0), m.start()))
+        else:
+            units.append((dec, m.start(), m.end()))
+        pos = m.end()
+    units.extend((ch, i, i + 1) for i, ch in enumerate(text[pos:], pos))
+
     chars: list[str] = []
-    idx: list[int] = []
-    for i, ch in enumerate(text):
+    starts: list[int] = []
+    ends: list[int] = []
+    for ch, b, e in units:
         if ch < "\x80":
             chars.append(ch.lower().translate(_LEET))
-            idx.append(i)
+            starts.append(b)
+            ends.append(e)
             continue
-        if _is_invisible(ch):
-            continue
+        if _is_invisible(ch) or unicodedata.category(ch) in ("So", "Sk", "Cs"):
+            continue  # zero-width / bidi / emoji / symbol: never part of a word
         for c in unicodedata.normalize("NFKC", ch).lower().translate(_CONFUSABLES):
-            if unicodedata.category(c) == "Mn":
+            if unicodedata.category(c) in ("Mn", "Me", "So", "Sk"):
                 continue
             chars.append(c.translate(_LEET))
-            idx.append(i)
+            starts.append(b)
+            ends.append(e)
     norm = "".join(chars)
     drop: set[int] = set()
     for m in _SPACED_RUN.finditer(norm):
@@ -747,11 +794,29 @@ def _normalise(text: str) -> tuple[str, list[int]]:
     if drop:
         keep = [k for k in range(len(norm)) if k not in drop]
         norm = "".join(norm[k] for k in keep)
-        idx = [idx[k] for k in keep]
-    return norm, idx
+        starts = [starts[k] for k in keep]
+        ends = [ends[k] for k in keep]
+    return norm, starts, ends
 
 
-_B64_BLOB = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=_-])")
+def _folded_chars(raw: str) -> str:
+    """Describe the non-ASCII characters in ``raw`` (what the fold had to undo)."""
+    names: list[str] = []
+    for c in raw:
+        if c >= "\x80" and not _is_invisible(c):
+            label = f"U+{ord(c):04X} {unicodedata.name(c, 'UNNAMED')}"
+            if label not in names:
+                names.append(label)
+    if not names:
+        return ""
+    return "; confusable characters: " + ", ".join(names[:4]) + (", ..." if len(names) > 4 else "")
+
+
+# Blobs of 24+ characters are considered; 24-39 only when they decode to text and sit
+# beside decode/follow language, so ordinary identifiers do not trip the check.
+_B64_BLOB = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/]{20,}={0,2}(?![A-Za-z0-9+/=_-])")
+_B64_SHORT = 24
+_B64_LONG = 40
 _DECODE_LANGUAGE = re.compile(
     r"(?i)\b(?:decod\w*|base\s*64|follow\s+(?:the|these|it|them|its)|execute|eval\w*|run\s+(?:it|the|this)|"
     r"instructions?)\b")
@@ -802,13 +867,20 @@ def check_gk04(doc: SourceDoc) -> Iterator[Finding]:
     if doc.root is None:
         return
     tool_of: dict[int, str] = {}
+    name_nodes: set[int] = set()
     for t in doc.tools:
         for n in t.node.walk():
             tool_of[id(n)] = t.name
+        name = t.node.get("name") if t.node.kind == "object" else None
+        if name is not None and name.is_str:
+            name_nodes.add(id(name))
     for node in doc.root.strings():
-        text = node.value
+        is_name = id(node) in name_nodes
+        # Tool names are identifiers: read "ignore_previous_instructions" as words.
+        # The substitution is 1:1, so match offsets still index the raw value.
+        text = re.sub(r"[_\-.]", " ", node.value) if is_name else node.value
         tool = tool_of.get(id(node))
-        where = f"tool '{tool}'" if tool else "manifest"
+        where = (f"tool name '{tool}'" if is_name else f"tool '{tool}'") if tool else "manifest"
         for m in _INVISIBLE_RUN.finditer(text):
             yield _finding("GK04", Severity.CRITICAL, node,
                            f"Hidden unicode in {where}: {_describe_invisible(m.group(0))}.",
@@ -824,18 +896,23 @@ def check_gk04(doc: SourceDoc) -> Iterator[Finding]:
                 yield _finding("GK04", sev, node, f"Prompt-injection {label} in {where}.",
                                begin=m.start(), end=m.end(), tool=tool)
         yield from _encoded_payloads(node, text, where, tool)
-        yield from _obfuscated(node, text, where, tool, strict)
+        yield from _obfuscated(node, text, where, tool, strict, force=is_name)
 
 
 def _encoded_payloads(node: Node, text: str, where: str, tool: Optional[str]) -> Iterator[Finding]:
     for m in _B64_BLOB.finditer(text):
-        decoded = _decode_b64_text(m.group(0))
+        blob = m.group(0)
+        decoded = _decode_b64_text(blob)
         labels = _injection_labels(decoded) if decoded else []
         if not labels and decoded:
-            norm, _ = _normalise(decoded)
+            norm = _normalise(decoded)[0]
             labels = [lbl for lbl, pat in _FUZZY_PATTERNS if pat.search(norm)]
         window = text[max(0, m.start() - 160):m.start()] + " " + text[m.end():m.end() + 160]
         near = bool(_DECODE_LANGUAGE.search(window))
+        if len(blob) < _B64_SHORT or (len(blob) < _B64_LONG and not (decoded and near)):
+            continue
+        if not decoded and not re.search(r"[0-9+/=]", blob):
+            continue  # a long run of letters only (an identifier), not an encoding
         if labels:
             preview = decoded if len(decoded) <= 80 else decoded[:77] + "..."
             yield _finding("GK04", Severity.HIGH, node,
@@ -849,25 +926,27 @@ def _encoded_payloads(node: Node, text: str, where: str, tool: Optional[str]) ->
 
 
 def _obfuscated(node: Node, text: str, where: str, tool: Optional[str],
-                strict: list[tuple[int, int]]) -> Iterator[Finding]:
-    if text.isascii():
+                strict: list[tuple[int, int]], force: bool = False) -> Iterator[Finding]:
+    if text.isascii() and not force:
         low = text.lower()
-        if not _LEET_ADJ.search(low) and not _SPACED_RUN.search(low):
+        if (not _LEET_ADJ.search(low) and not _SPACED_RUN.search(low)
+                and not (("&" in low or "\\" in low) and _TEXT_ESCAPE.search(text))):
             return  # plain ASCII with nothing to de-obfuscate: the strict pass covered it
-    norm, idx = _normalise(text)
-    if norm == text.lower():
+    norm, starts, ends = _normalise(text)
+    if norm == text.lower() and not force:
         return
     for label, pat in _FUZZY_PATTERNS:
         for m in pat.finditer(norm):
             if m.end() <= m.start():
                 continue
-            b, e = idx[m.start()], idx[m.end() - 1] + 1
+            b, e = starts[m.start()], ends[m.end() - 1]
             if any(sb < e and b < se for sb, se in strict):
                 continue
             strict.append((b, e))
             yield _finding("GK04R", Severity.MEDIUM, node,
                            f"Possible obfuscated {label} in {where}: reads as {m.group(0)!r} after "
-                           f"unicode/homoglyph/spacing/leetspeak normalisation. Review before connecting.",
+                           f"escape/unicode/homoglyph/spacing/leetspeak normalisation"
+                           f"{_folded_chars(text[b:e])}. Review before connecting.",
                            begin=b, end=e, tool=tool)
 
 
@@ -893,6 +972,18 @@ _DANGER_PAIRS = {("run", "command"), ("execute", "command"), ("run", "script"), 
 def _name_tokens(name: str) -> list[str]:
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
     return [t for t in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if t]
+
+
+def _fold_name(name: str) -> str:
+    """NFKC + homoglyph fold a tool name, keeping case and separators (no leetspeak)."""
+    out = []
+    for ch in name:
+        if ch < "\x80":
+            out.append(ch)
+        elif not _is_invisible(ch):
+            out.extend(c for c in unicodedata.normalize("NFKC", ch).translate(_CONFUSABLES)
+                       if unicodedata.category(c) != "Mn")
+    return "".join(out)
 
 
 def _dangerous_tool(name: str) -> Optional[str]:
@@ -962,6 +1053,14 @@ def check_gk05_manifest(doc: SourceDoc) -> Iterator[Finding]:
         if hit:
             yield _finding("GK05", Severity.HIGH, name,
                            f"Tool '{name.value}' exposes arbitrary command/code execution ('{hit}').",
+                           tool=name.value)
+            continue
+        folded = _fold_name(name.value)
+        hit = _dangerous_tool(folded) if folded != name.value else None
+        if hit:
+            yield _finding("GK05", Severity.HIGH, name,
+                           f"Tool '{name.value}' reads as '{folded}' after homoglyph/NFKC folding and exposes "
+                           f"arbitrary command/code execution ('{hit}'){_folded_chars(name.value)}.",
                            tool=name.value)
 
 

@@ -52,7 +52,7 @@ REPORT_SCHEMA: dict = {
         "tool": {"const": "mcp-gatekeeper"},
         "version": {"type": "string"},
         "schema_version": {"const": SCHEMA_VERSION},
-        "fail_on": {"type": "string", "enum": SEVERITY_LABELS + ["none"]},
+        "fail_on": {"type": "string", "enum": SEVERITY_LABELS + ["review", "none"]},
         "passed": {"type": "boolean"},
         "exit_code": {"type": "integer", "enum": [0, 1, 2]},
         "scanned_files": {
