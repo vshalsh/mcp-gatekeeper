@@ -1,0 +1,11 @@
+# Tool manifest in YAML form (tools/list result, hand-maintained)
+tools:
+  - name: search_docs
+    description: Full-text search over the product documentation.
+    inputSchema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Search terms
+      required: [query]

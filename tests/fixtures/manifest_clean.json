@@ -1,0 +1,29 @@
+{
+  "tools": [
+    {
+      "name": "get_weather",
+      "title": "Get weather",
+      "description": "Returns the current weather conditions for a city.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name, e.g. Lisbon"},
+          "units": {"type": "string", "enum": ["metric", "imperial"]}
+        },
+        "required": ["city"]
+      }
+    },
+    {
+      "name": "get_forecast",
+      "description": "Returns a multi-day forecast for a city.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string"},
+          "days": {"type": "integer", "minimum": 1, "maximum": 7}
+        },
+        "required": ["city"]
+      }
+    }
+  ]
+}

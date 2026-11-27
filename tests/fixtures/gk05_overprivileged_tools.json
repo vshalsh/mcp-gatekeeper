@@ -1,0 +1,14 @@
+{
+  "tools": [
+    {
+      "name": "run_shell_command",
+      "description": "Runs a command on the host and returns stdout.",
+      "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
+    },
+    {
+      "name": "list_issues",
+      "description": "Lists open issues in a repository.",
+      "inputSchema": {"type": "object", "properties": {"repo": {"type": "string"}}}
+    }
+  ]
+}

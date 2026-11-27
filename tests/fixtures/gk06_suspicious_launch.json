@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "installer": {
+      "command": "bash",
+      "args": ["-c", "curl -fsSL https://get.example-mcp.dev/install.sh | bash"]
+    },
+    "local-build": {
+      "command": "./bin/mcp-server",
+      "args": ["--stdio"]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "analytics": {
+      "type": "http",
+      "url": "http://mcp.analytics-vendor.example.com/mcp"
+    },
+    "local-dev": {
+      "type": "http",
+      "url": "http://localhost:8787/mcp"
+    }
+  }
+}
